@@ -1,60 +1,57 @@
 """
-Pure in-memory state. Everything here is lost when the process restarts
-(e.g. Render free tier spinning down after 15 min idle, or a redeploy).
+In-memory state for the "buy numbers" bot — multi-select version.
+Everything here resets when the process restarts (Render free tier sleep/redeploy).
 
-number_status[n] one of: "free", "pending", "taken"
-number_owner[n]  -> user_id once pending/taken
-pending_screenshots[user_id] -> (number, file_id)
+There is ONE live table at a time (table["id"] increments each time admin starts a new one).
 """
 
-number_status = {}
-number_owner = {}
-pending_screenshots = {}
+table = {
+    "id": 0,
+    "total": 0,
+    "channel_message_id": None,
+    "ended": False,
+    "winner": None,        # {"number": n, "name": "..."}
+    "numbers": {},         # n -> {"status": "free"/"pending"/"sold", "user_id": None, "name": None}
+}
+
+user_selection = {}    # user_id -> set of numbers currently selected, not yet submitted for approval
+conv_state = {}        # user_id -> "await_phone" / "await_username" / "await_name" / "await_screenshot" / None
+draft_info = {}        # user_id -> {"phone": .., "username": .., "name": ..}
+pending_approvals = {}  # user_id -> {"numbers": [...], "phone": .., "username": .., "name": .., "photo_file_id": ..}
+user_view_msg = {}     # user_id -> (chat_id, message_id) of that user's current table view in their own chat
 
 
-def _ensure_init(total):
-    if not number_status:
-        for n in range(1, total + 1):
-            number_status[n] = "free"
+def new_table(total):
+    table["id"] += 1
+    table["total"] = total
+    table["channel_message_id"] = None
+    table["ended"] = False
+    table["winner"] = None
+    table["numbers"] = {n: {"status": "free", "user_id": None, "name": None} for n in range(1, total + 1)}
+    user_selection.clear()
+    conv_state.clear()
+    draft_info.clear()
+    pending_approvals.clear()
+    user_view_msg.clear()
 
 
-def get_available_numbers(total):
-    _ensure_init(total)
-    return [n for n, s in number_status.items() if s == "free"]
+def get_selection(user_id):
+    return user_selection.setdefault(user_id, set())
 
 
-def reserve_number(number, user_id):
-    if number_status.get(number) != "free":
-        return False
-    number_status[number] = "pending"
-    number_owner[number] = user_id
-    return True
+def clear_user_progress(user_id):
+    user_selection.pop(user_id, None)
+    conv_state.pop(user_id, None)
+    draft_info.pop(user_id, None)
 
 
-def release_number(number):
-    number_status[number] = "free"
-    number_owner.pop(number, None)
-
-
-def confirm_number(number, user_id):
-    number_status[number] = "taken"
-    number_owner[number] = user_id
-
-
-def set_pending_screenshot(user_id, number, file_id):
-    pending_screenshots[user_id] = (number, file_id)
-
-
-def pop_pending_screenshot(user_id):
-    return pending_screenshots.pop(user_id, None)
-
-
-def get_user_pending_number(user_id):
-    entry = pending_screenshots.get(user_id)
-    if entry:
-        return entry[0]
-    # also check if they reserved a number but haven't sent a screenshot yet
-    for n, owner in number_owner.items():
-        if owner == user_id and number_status.get(n) == "pending":
-            return n
-    return None
+def release_numbers(numbers, only_if_owner=None):
+    for n in numbers:
+        info = table["numbers"].get(n)
+        if not info:
+            continue
+        if only_if_owner is not None and info.get("user_id") != only_if_owner:
+            continue
+        info["status"] = "free"
+        info["user_id"] = None
+        info["name"] = None
