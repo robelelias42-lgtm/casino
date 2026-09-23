@@ -1,21 +1,23 @@
 """
-Telegram "buy a number" bot — webhook mode, no database.
+Telegram "buy numbers" bot — webhook mode, no database.
 
-Flow:
-  1. User runs /start -> sees a table of numbers (inline buttons) that are NOT taken.
-  2. User taps a number -> bot marks it "pending" and asks them to send a payment screenshot.
-  3. User sends a photo -> bot forwards it to the ADMIN_CHAT_ID with Approve/Reject buttons.
-  4. Admin taps Approve -> number is confirmed, bot posts the winner/owner to CHANNEL_ID,
-     and tells the user their number is confirmed.
-     Admin taps Reject -> number is released back into the pool, user is notified.
+USER FLOW
+  1. /start -> sees the live table as colored numbers:
+        🟢 free   🟡 requested (someone is buying it)   🔴 sold
+     Tapping a green number selects it (multi-select). Tap again to deselect.
+  2. Tap "✅ Done" -> bot asks for phone number, then telegram username, then name/nickname.
+  3. Bot asks for a payment screenshot -> forwarded to the admin with Approve/Reject buttons.
+  4. Admin Approve -> numbers become sold, buyer's NAME appears next to them in the channel
+     list (phone/username are shown to the admin only, not posted publicly).
+     Admin Reject -> numbers go back to free, user is notified.
 
-State lives in a plain Python dict (see `state.py`). This means:
-  - It resets to empty every time the Render free service restarts / redeploys / cold-starts
-    after sleeping. A payment stuck "pending" when that happens is lost.
-  - Only ONE process/instance can run (no horizontal scaling), which is fine on free tier anyway.
+ADMIN FLOW (admin talks to the bot directly, in a private chat)
+  /newtable 50      -> starts a brand-new table with 50 numbers (1..50), posts a fresh
+                        list message in the channel, resets everything from the old table.
+  /endtable 7       -> ends the current table and appends the winner (number 7) in BOLD
+                        at the bottom of the channel list.
 
-Deploy on Render as a "Web Service" (NOT a background worker/cron), because Telegram needs
-an HTTPS URL to POST updates to.
+Everything is in-memory (see state.py) — a Render free-tier restart wipes it.
 """
 
 import os
@@ -23,32 +25,33 @@ import logging
 from flask import Flask, request, jsonify
 import requests
 
-from state import (
-    get_available_numbers,
-    reserve_number,
-    release_number,
-    confirm_number,
-    set_pending_screenshot,
-    pop_pending_screenshot,
-    get_user_pending_number,
-)
+import state
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]                     # set in Render env vars
-ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])        # your personal telegram numeric id
-CHANNEL_ID = os.environ["CHANNEL_ID"]                   # e.g. "@your_channel" or -100123456789
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")   # optional shared-secret path guard
-TOTAL_NUMBERS = int(os.environ.get("TOTAL_NUMBERS", "100"))
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])
+CHANNEL_ID = os.environ["CHANNEL_ID"]
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+DEFAULT_TOTAL_NUMBERS = int(os.environ.get("TOTAL_NUMBERS", "100"))
 PRICE = os.environ.get("PRICE", "100 ETB")
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+FREE, PENDING, SOLD = "🟢", "🟡", "🔴"
+
 app = Flask(__name__)
 
+# Start with a default table so /start works even before admin runs /newtable.
+state.new_table(DEFAULT_TOTAL_NUMBERS)
 
-# ---------- small helpers to talk to Telegram ----------
+
+# ---------- helpers ----------
+
+def esc(text):
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 
 def tg(method, payload):
     r = requests.post(f"{API_URL}/{method}", json=payload, timeout=15)
@@ -57,10 +60,12 @@ def tg(method, payload):
     return r.json()
 
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, parse_mode=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     return tg("sendMessage", payload)
 
 
@@ -71,128 +76,307 @@ def answer_callback(callback_id, text=None):
     tg("answerCallbackQuery", payload)
 
 
-def numbers_keyboard():
-    available = get_available_numbers(TOTAL_NUMBERS)
+def is_admin(user_id):
+    return user_id == ADMIN_CHAT_ID
+
+
+# ---------- rendering ----------
+
+def render_table_text():
+    t = state.table
+    lines = [
+        f"🎯 <b>Table #{t['id']}</b> — {t['total']} numbers",
+        f"💰 Price: {esc(PRICE)} each",
+        "",
+    ]
     row, rows = [], []
-    for n in available:
-        row.append({"text": str(n), "callback_data": f"pick:{n}"})
+    for n in range(1, t["total"] + 1):
+        info = t["numbers"][n]
+        if info["status"] == "sold":
+            label = f"{SOLD}{n}"
+            if info.get("name"):
+                label += f"·{esc(info['name'])}"
+        elif info["status"] == "pending":
+            label = f"{PENDING}{n}"
+        else:
+            label = f"{FREE}{n}"
+        row.append(label)
+        if len(row) == 5:
+            rows.append(" ".join(row))
+            row = []
+    if row:
+        rows.append(" ".join(row))
+    lines.extend(rows)
+    lines.append("")
+    lines.append(f"{FREE} Free    {PENDING} Requested    {SOLD} Sold")
+    if t.get("winner"):
+        lines.append("")
+        w = t["winner"]
+        lines.append(f"🏆 <b>WINNER: Number {w['number']} — {esc(w['name'])}</b> 🏆")
+    return "\n".join(lines)
+
+
+def render_keyboard(user_id):
+    t = state.table
+    selected = state.get_selection(user_id)
+    row, rows = [], []
+    for n in range(1, t["total"] + 1):
+        info = t["numbers"][n]
+        if info["status"] == "sold":
+            text = f"🔴{n}"
+        elif n in selected:
+            text = f"✅{n}"
+        elif info["status"] == "pending":
+            text = f"🟡{n}"
+        else:
+            text = f"🟢{n}"
+        row.append({"text": text, "callback_data": f"tog:{n}"})
         if len(row) == 5:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    return {"inline_keyboard": rows} if rows else None
+    if not t.get("ended"):
+        rows.append([{"text": f"✅ Done ({len(selected)} picked)", "callback_data": "done"}])
+    return {"inline_keyboard": rows}
 
 
-def approval_keyboard(user_id, number):
+def update_channel_message():
+    t = state.table
+    text = render_table_text()
+    if t.get("channel_message_id"):
+        tg("editMessageText", {
+            "chat_id": CHANNEL_ID, "message_id": t["channel_message_id"],
+            "text": text, "parse_mode": "HTML",
+        })
+    else:
+        r = tg("sendMessage", {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML"})
+        t["channel_message_id"] = r.get("result", {}).get("message_id")
+
+
+def show_table_to_user(chat_id, user_id):
+    text = render_table_text() + "\n\nTap numbers to pick, then hit Done."
+    kb = render_keyboard(user_id)
+    old = state.user_view_msg.get(user_id)
+    if old:
+        try:
+            tg("deleteMessage", {"chat_id": old[0], "message_id": old[1]})
+        except Exception:
+            pass
+    r = tg("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": kb})
+    mid = r.get("result", {}).get("message_id")
+    if mid:
+        state.user_view_msg[user_id] = (chat_id, mid)
+
+
+def refresh_user_view_in_place(chat_id, message_id, user_id):
+    text = render_table_text() + "\n\nTap numbers to pick, then hit Done."
+    kb = render_keyboard(user_id)
+    tg("editMessageText", {
+        "chat_id": chat_id, "message_id": message_id,
+        "text": text, "parse_mode": "HTML", "reply_markup": kb,
+    })
+
+
+def approval_keyboard(user_id):
     return {
         "inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": f"approve:{user_id}:{number}"},
-            {"text": "❌ Reject", "callback_data": f"reject:{user_id}:{number}"},
+            {"text": "✅ Approve", "callback_data": f"approve:{user_id}"},
+            {"text": "❌ Reject", "callback_data": f"reject:{user_id}"},
         ]]
     }
 
 
-# ---------- webhook endpoint ----------
+# ---------- webhook ----------
 
 @app.route(f"/webhook/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else "/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True)
     log.info("update: %s", update)
-
     if "message" in update:
         handle_message(update["message"])
     elif "callback_query" in update:
         handle_callback(update["callback_query"])
-
     return jsonify(ok=True)
 
 
 @app.route("/", methods=["GET"])
 def health():
-    # Render free tier will hit this to check the service is alive.
     return "bot is running", 200
 
 
-# ---------- message + callback logic ----------
+# ---------- message handling ----------
 
 def handle_message(msg):
     chat_id = msg["chat"]["id"]
     user_id = msg["from"]["id"]
-    username = msg["from"].get("username") or msg["from"].get("first_name", "user")
+    text = msg.get("text", "")
 
-    if "text" in msg and msg["text"].startswith("/start"):
-        kb = numbers_keyboard()
-        if kb is None:
-            send_message(chat_id, "Sorry, all numbers are currently taken.")
-        else:
-            send_message(
-                chat_id,
-                f"Pick a number below to buy it for {PRICE}.\n"
-                f"After picking, send a screenshot of your payment for approval.",
-                reply_markup=kb,
-            )
+    # --- admin commands ---
+    if is_admin(user_id) and text.startswith("/newtable"):
+        parts = text.split()
+        total = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else DEFAULT_TOTAL_NUMBERS
+        state.new_table(total)
+        update_channel_message()
+        send_message(chat_id, f"New table #{state.table['id']} started with {total} numbers. Posted to the channel.")
         return
 
-    if "photo" in msg:
-        pending_number = get_user_pending_number(user_id)
-        if pending_number is None:
-            send_message(chat_id, "Pick a number first with /start before sending a screenshot.")
+    if is_admin(user_id) and text.startswith("/endtable"):
+        parts = text.split()
+        if len(parts) < 2 or not parts[1].isdigit():
+            send_message(chat_id, "Usage: /endtable <winning number>, e.g. /endtable 7")
             return
+        n = int(parts[1])
+        info = state.table["numbers"].get(n)
+        if not info or info["status"] != "sold":
+            send_message(chat_id, f"Number {n} was never sold, pick a sold number.")
+            return
+        state.table["ended"] = True
+        state.table["winner"] = {"number": n, "name": info.get("name") or "Unknown"}
+        update_channel_message()
+        send_message(chat_id, f"Table ended. Winner (#{n}) posted to the channel.")
+        return
 
-        file_id = msg["photo"][-1]["file_id"]  # largest size
-        set_pending_screenshot(user_id, pending_number, file_id)
+    if text.startswith("/start"):
+        state.clear_user_progress(user_id)
+        show_table_to_user(chat_id, user_id)
+        return
 
-        # Forward the screenshot to the admin with approve/reject buttons
+    if text.startswith("/cancel"):
+        selected = state.get_selection(user_id)
+        state.release_numbers(selected, only_if_owner=user_id)
+        state.clear_user_progress(user_id)
+        update_channel_message()
+        send_message(chat_id, "Your in-progress picks were released. Send /start to pick again.")
+        return
+
+    conv = state.conv_state.get(user_id)
+
+    if conv == "await_phone":
+        state.draft_info.setdefault(user_id, {})["phone"] = text.strip()
+        state.conv_state[user_id] = "await_username"
+        send_message(chat_id, "Got it. Now send your Telegram username (e.g. @yourname):")
+        return
+
+    if conv == "await_username":
+        state.draft_info.setdefault(user_id, {})["username"] = text.strip()
+        state.conv_state[user_id] = "await_name"
+        send_message(chat_id, "Now send your full name or nickname:")
+        return
+
+    if conv == "await_name":
+        state.draft_info.setdefault(user_id, {})["name"] = text.strip()
+        state.conv_state[user_id] = "await_screenshot"
+        send_message(chat_id, "Last step — send a screenshot of your payment.")
+        return
+
+    if "photo" in msg and conv == "await_screenshot":
+        file_id = msg["photo"][-1]["file_id"]
+        info = state.draft_info.get(user_id, {})
+        numbers = sorted(state.get_selection(user_id))
+        state.pending_approvals[user_id] = {
+            "numbers": numbers,
+            "phone": info.get("phone", ""),
+            "username": info.get("username", ""),
+            "name": info.get("name", ""),
+            "photo_file_id": file_id,
+        }
+        caption = (
+            f"Payment screenshot\n"
+            f"Numbers: {', '.join(map(str, numbers))}\n"
+            f"Name: {info.get('name','')}\n"
+            f"Username: {info.get('username','')}\n"
+            f"Phone: {info.get('phone','')}\n"
+            f"(telegram id {user_id})"
+        )
         tg("sendPhoto", {
-            "chat_id": ADMIN_CHAT_ID,
-            "photo": file_id,
-            "caption": f"Payment screenshot\nUser: @{username} (id {user_id})\nNumber: {pending_number}",
-            "reply_markup": approval_keyboard(user_id, pending_number),
+            "chat_id": ADMIN_CHAT_ID, "photo": file_id, "caption": caption,
+            "reply_markup": approval_keyboard(user_id),
         })
         send_message(chat_id, "Screenshot received. Waiting for admin approval.")
+        state.conv_state[user_id] = None
         return
 
-    # fallback
-    send_message(chat_id, "Send /start to see available numbers.")
+    send_message(chat_id, "Send /start to see the live table.")
 
+
+# ---------- callback handling ----------
 
 def handle_callback(cq):
     data = cq["data"]
     callback_id = cq["id"]
-    from_user = cq["from"]["id"]
-    username = cq["from"].get("username") or cq["from"].get("first_name", "user")
+    user_id = cq["from"]["id"]
+    chat_id = cq["message"]["chat"]["id"]
+    message_id = cq["message"]["message_id"]
 
-    if data.startswith("pick:"):
-        number = int(data.split(":")[1])
-        ok = reserve_number(number, from_user)
-        if ok:
-            answer_callback(callback_id, f"You picked #{number}")
-            send_message(from_user, f"You picked #{number} ({PRICE}). Now send a screenshot of your payment.")
+    if data.startswith("tog:"):
+        if state.table.get("ended"):
+            answer_callback(callback_id, "This table has ended.")
+            return
+        n = int(data.split(":")[1])
+        info = state.table["numbers"].get(n)
+        selected = state.get_selection(user_id)
+
+        if info["status"] == "sold":
+            answer_callback(callback_id, "That number is already sold.")
+            return
+        if info["status"] == "pending" and info.get("user_id") != user_id and n not in selected:
+            answer_callback(callback_id, "Someone else is already buying that number.")
+            return
+
+        if n in selected:
+            selected.discard(n)
+            info["status"] = "free"
+            info["user_id"] = None
         else:
-            answer_callback(callback_id, "That number was just taken, pick another.")
+            selected.add(n)
+            info["status"] = "pending"
+            info["user_id"] = user_id
+
+        refresh_user_view_in_place(chat_id, message_id, user_id)
+        update_channel_message()
+        answer_callback(callback_id)
         return
 
-    if data.startswith("approve:") and from_user == ADMIN_CHAT_ID:
-        _, user_id, number = data.split(":")
-        user_id, number = int(user_id), int(number)
-        confirm_number(number, user_id)
-        pop_pending_screenshot(user_id)
+    if data == "done":
+        selected = state.get_selection(user_id)
+        if not selected:
+            answer_callback(callback_id, "Pick at least one number first.")
+            return
+        answer_callback(callback_id, "Great — now send your details.")
+        state.conv_state[user_id] = "await_phone"
+        send_message(chat_id, f"You picked: {', '.join(map(str, sorted(selected)))}.\nPlease send your phone number:")
+        return
+
+    if data.startswith("approve:") and user_id == ADMIN_CHAT_ID:
+        buyer_id = int(data.split(":")[1])
+        approval = state.pending_approvals.pop(buyer_id, None)
+        if not approval:
+            answer_callback(callback_id, "No pending approval found (maybe already handled).")
+            return
+        for n in approval["numbers"]:
+            info = state.table["numbers"].get(n)
+            if info:
+                info["status"] = "sold"
+                info["user_id"] = buyer_id
+                info["name"] = approval["name"]
+        state.clear_user_progress(buyer_id)
+        update_channel_message()
         answer_callback(callback_id, "Approved")
-        send_message(user_id, f"✅ Your payment for number {number} was approved!")
-        tg("sendMessage", {
-            "chat_id": CHANNEL_ID,
-            "text": f"🎉 Number {number} has been claimed!",
-        })
+        send_message(buyer_id, f"✅ Approved! Numbers {', '.join(map(str, approval['numbers']))} are now yours.")
         return
 
-    if data.startswith("reject:") and from_user == ADMIN_CHAT_ID:
-        _, user_id, number = data.split(":")
-        user_id, number = int(user_id), int(number)
-        release_number(number)
-        pop_pending_screenshot(user_id)
+    if data.startswith("reject:") and user_id == ADMIN_CHAT_ID:
+        buyer_id = int(data.split(":")[1])
+        approval = state.pending_approvals.pop(buyer_id, None)
+        if not approval:
+            answer_callback(callback_id, "No pending approval found (maybe already handled).")
+            return
+        state.release_numbers(approval["numbers"], only_if_owner=buyer_id)
+        state.clear_user_progress(buyer_id)
+        update_channel_message()
         answer_callback(callback_id, "Rejected")
-        send_message(user_id, f"❌ Your payment for number {number} was rejected. Please try again.")
+        send_message(buyer_id, "❌ Your payment was rejected. Send /start to try again.")
         return
 
     answer_callback(callback_id)
