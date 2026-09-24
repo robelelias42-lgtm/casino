@@ -69,13 +69,14 @@ Message the bot **directly, in a private chat** (not the channel) as the admin a
 
 ## How it works (user)
 1. `/start` — shows the live table with colored numbers: 🟢 free, 🟡 requested, 🔴 sold.
-2. Tap any green number to select it (tap again to deselect) — multiple numbers can be
-   picked at once. The same message updates in place, so the chat doesn't fill up with
-   repeated tables.
+2. Reply with the numbers you want as plain text, e.g. `3, 17, 42` — you can send more
+   than once to add more numbers. (Numbers are picked by typing, not by tapping each one
+   individually — Telegram inline keyboards break past ~100 buttons, which is too small
+   for a 100-number table if every number were its own button.)
 3. Tap "✅ Done", then answer the phone number / username / name prompts.
 4. Send a screenshot of the payment — it goes to the admin for approval.
-5. `/cancel` — if a user wants to back out before sending a screenshot, this releases
-   their in-progress picks back to "free".
+5. Tap "❌ Cancel picks" (or send `/cancel`) to back out before sending a screenshot —
+   this releases your in-progress picks back to "free".
 
 ## Known limitations of this "no database" setup
 - **State is in-memory only.** Render's free tier sleeps the service after ~15 minutes
