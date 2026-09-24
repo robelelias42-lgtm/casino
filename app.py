@@ -4,7 +4,8 @@ Telegram "buy numbers" bot — webhook mode, no database.
 USER FLOW
   1. /start -> sees the live table as colored numbers:
         🟢 free   🟡 requested (someone is buying it)   🔴 sold
-     Tapping a green number selects it (multi-select). Tap again to deselect.
+     Picks numbers by REPLYING WITH TEXT, e.g. "3, 17, 42" (not by tapping each one —
+     Telegram inline keyboards cap out around 100 buttons, which breaks at large table sizes).
   2. Tap "✅ Done" -> bot asks for phone number, then telegram username, then name/nickname.
   3. Bot asks for a payment screenshot -> forwarded to the admin with Approve/Reject buttons.
   4. Admin Approve -> numbers become sold, buyer's NAME appears next to them in the channel
@@ -116,29 +117,18 @@ def render_table_text():
     return "\n".join(lines)
 
 
-def render_keyboard(user_id):
-    t = state.table
+def render_picker_keyboard(user_id):
+    # Only 2 buttons here (safe at any table size — Telegram caps inline keyboards
+    # around 100 buttons total, which is why per-number tap buttons don't scale).
     selected = state.get_selection(user_id)
-    row, rows = [], []
-    for n in range(1, t["total"] + 1):
-        info = t["numbers"][n]
-        if info["status"] == "sold":
-            text = f"🔴{n}"
-        elif n in selected:
-            text = f"✅{n}"
-        elif info["status"] == "pending":
-            text = f"🟡{n}"
-        else:
-            text = f"🟢{n}"
-        row.append({"text": text, "callback_data": f"tog:{n}"})
-        if len(row) == 5:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    if not t.get("ended"):
-        rows.append([{"text": f"✅ Done ({len(selected)} picked)", "callback_data": "done"}])
-    return {"inline_keyboard": rows}
+    if not selected:
+        return None
+    return {
+        "inline_keyboard": [[
+            {"text": f"✅ Done ({len(selected)} picked)", "callback_data": "done"},
+            {"text": "❌ Cancel picks", "callback_data": "cancelpicks"},
+        ]]
+    }
 
 
 def update_channel_message():
@@ -154,28 +144,71 @@ def update_channel_message():
         t["channel_message_id"] = r.get("result", {}).get("message_id")
 
 
+def picker_instructions(user_id):
+    selected = state.get_selection(user_id)
+    if selected:
+        return (f"Your picks so far: {', '.join(map(str, sorted(selected)))}\n"
+                f"Reply with more numbers to add, or tap Done / Cancel below.")
+    return "Reply with the numbers you want, separated by commas (e.g. 3, 17, 42)."
+
+
 def show_table_to_user(chat_id, user_id):
-    text = render_table_text() + "\n\nTap numbers to pick, then hit Done."
-    kb = render_keyboard(user_id)
+    text = render_table_text() + "\n\n" + picker_instructions(user_id)
+    kb = render_picker_keyboard(user_id)
     old = state.user_view_msg.get(user_id)
     if old:
         try:
             tg("deleteMessage", {"chat_id": old[0], "message_id": old[1]})
         except Exception:
             pass
-    r = tg("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "reply_markup": kb})
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if kb:
+        payload["reply_markup"] = kb
+    r = tg("sendMessage", payload)
     mid = r.get("result", {}).get("message_id")
     if mid:
         state.user_view_msg[user_id] = (chat_id, mid)
 
 
-def refresh_user_view_in_place(chat_id, message_id, user_id):
-    text = render_table_text() + "\n\nTap numbers to pick, then hit Done."
-    kb = render_keyboard(user_id)
-    tg("editMessageText", {
-        "chat_id": chat_id, "message_id": message_id,
-        "text": text, "parse_mode": "HTML", "reply_markup": kb,
-    })
+def refresh_user_view_in_place(user_id):
+    old = state.user_view_msg.get(user_id)
+    if not old:
+        return
+    chat_id, message_id = old
+    text = render_table_text() + "\n\n" + picker_instructions(user_id)
+    kb = render_picker_keyboard(user_id)
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+    if kb:
+        payload["reply_markup"] = kb
+    tg("editMessageText", payload)
+
+
+def finalize_selection(chat_id, user_id):
+    selected = state.get_selection(user_id)
+    if not selected:
+        send_message(chat_id, "Pick at least one number first (reply with numbers like 3, 17, 42), then /done.")
+        return
+    state.conv_state[user_id] = "await_phone"
+    send_message(chat_id, f"You picked: {', '.join(map(str, sorted(selected)))}.\nPlease send your phone number:")
+
+
+def handle_number_picks(chat_id, user_id, text):
+    import re
+    candidates = [int(x) for x in re.findall(r"\d+", text)]
+    if not candidates:
+        send_message(chat_id, "Send /start to see the live table, or reply with numbers like 3, 17, 42 to pick them.")
+        return
+    added, rejected = state.try_reserve(candidates, user_id)
+    update_channel_message()
+    refresh_user_view_in_place(user_id)
+
+    parts = []
+    if added:
+        parts.append(f"Added: {', '.join(map(str, added))}")
+    if rejected:
+        parts.append("Couldn't add: " + ", ".join(f"{n} ({reason})" for n, reason in rejected))
+    parts.append("Reply with more numbers, tap ✅ Done when finished, or ❌ Cancel picks.")
+    send_message(chat_id, "\n".join(parts))
 
 
 def approval_keyboard(user_id):
@@ -242,6 +275,10 @@ def handle_message(msg):
         show_table_to_user(chat_id, user_id)
         return
 
+    if text.startswith("/done"):
+        finalize_selection(chat_id, user_id)
+        return
+
     if text.startswith("/cancel"):
         selected = state.get_selection(user_id)
         state.release_numbers(selected, only_if_owner=user_id)
@@ -297,6 +334,10 @@ def handle_message(msg):
         state.conv_state[user_id] = None
         return
 
+    if conv is None and text and not text.startswith("/"):
+        handle_number_picks(chat_id, user_id, text)
+        return
+
     send_message(chat_id, "Send /start to see the live table.")
 
 
@@ -309,43 +350,21 @@ def handle_callback(cq):
     chat_id = cq["message"]["chat"]["id"]
     message_id = cq["message"]["message_id"]
 
-    if data.startswith("tog:"):
-        if state.table.get("ended"):
-            answer_callback(callback_id, "This table has ended.")
-            return
-        n = int(data.split(":")[1])
-        info = state.table["numbers"].get(n)
+    if data == "cancelpicks":
         selected = state.get_selection(user_id)
-
-        if info["status"] == "sold":
-            answer_callback(callback_id, "That number is already sold.")
-            return
-        if info["status"] == "pending" and info.get("user_id") != user_id and n not in selected:
-            answer_callback(callback_id, "Someone else is already buying that number.")
-            return
-
-        if n in selected:
-            selected.discard(n)
-            info["status"] = "free"
-            info["user_id"] = None
-        else:
-            selected.add(n)
-            info["status"] = "pending"
-            info["user_id"] = user_id
-
-        refresh_user_view_in_place(chat_id, message_id, user_id)
+        state.release_numbers(selected, only_if_owner=user_id)
+        state.clear_user_progress(user_id)
         update_channel_message()
-        answer_callback(callback_id)
+        refresh_user_view_in_place(user_id)
+        answer_callback(callback_id, "Picks cancelled.")
         return
 
     if data == "done":
-        selected = state.get_selection(user_id)
-        if not selected:
+        if not state.get_selection(user_id):
             answer_callback(callback_id, "Pick at least one number first.")
             return
         answer_callback(callback_id, "Great — now send your details.")
-        state.conv_state[user_id] = "await_phone"
-        send_message(chat_id, f"You picked: {', '.join(map(str, sorted(selected)))}.\nPlease send your phone number:")
+        finalize_selection(chat_id, user_id)
         return
 
     if data.startswith("approve:") and user_id == ADMIN_CHAT_ID:
