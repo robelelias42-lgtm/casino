@@ -45,6 +45,28 @@ def clear_user_progress(user_id):
     draft_info.pop(user_id, None)
 
 
+def try_reserve(numbers, user_id):
+    """Attempt to mark each number 'pending' for this user. Returns (added, rejected)
+    where rejected is a list of (number, reason) tuples."""
+    added, rejected = [], []
+    for n in numbers:
+        info = table["numbers"].get(n)
+        if not info:
+            rejected.append((n, "not on the table"))
+            continue
+        if info["status"] == "sold":
+            rejected.append((n, "already sold"))
+            continue
+        if info["status"] == "pending" and info["user_id"] != user_id:
+            rejected.append((n, "requested by someone else"))
+            continue
+        info["status"] = "pending"
+        info["user_id"] = user_id
+        get_selection(user_id).add(n)
+        added.append(n)
+    return added, rejected
+
+
 def release_numbers(numbers, only_if_owner=None):
     for n in numbers:
         info = table["numbers"].get(n)
